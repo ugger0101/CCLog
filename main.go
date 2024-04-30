@@ -3,11 +3,21 @@ package main
 import (
 	"CCLog/common"
 	"CCLog/etcd"
+	"CCLog/info"
 	"CCLog/kafka"
 	"CCLog/tailfile"
 	"fmt"
 	"github.com/go-ini/ini"
 	"github.com/sirupsen/logrus"
+	"os"
+	"strings"
+	"sync"
+	"time"
+)
+
+var (
+	log *logrus.Logger
+	wg  sync.WaitGroup
 )
 
 type Config struct {
@@ -24,51 +34,82 @@ type CollectConfig struct {
 	LogFilePath string `ini:"logfile_path"`
 }
 type EtcdConfig struct {
-	Address    string `ini:"address"`
-	CollectKey string `ini:"collect_key"`
+	Address           string `ini:"address"`
+	CollectKey        string `ini:"collect_key"`
+	CollectSysInfoKey string `ini:"collect_sysinfo_key"`
 }
 
+func initLogger() {
+	log = logrus.New()
+	log.Out = os.Stdout
+	log.Level = logrus.DebugLevel
+
+	log.Info("init log success")
+}
+
+func run(logConfKey string, sysInfoConf *common.CollectSysInfoConfig) {
+	wg.Add(2)
+	go etcd.WatchConf(logConfKey)
+	go info.Run(time.Duration(sysInfoConf.Interval)*time.Second, sysInfoConf.Topic)
+	wg.Wait()
+}
 func main() {
-	var configObj = new(Config)
+	initLogger()
+	// 初始化配置文件
+	var conf Config
+	err := ini.MapTo(&conf, "./conf/config.ini")
+	if err != nil {
+		panic(fmt.Sprintf("init config failed, err:%v", err))
+	}
+	// 初始化kafka
+	err = kafka.Init(strings.Split(conf.KafkaConfig.Address, ","), conf.KafkaConfig.ChanSize)
+	if err != nil {
+		panic(fmt.Sprintf("init kafka failed, err:%v", err))
+	}
+
+	// 初始化etcd
 	ip, err := common.GetOutboundIp()
 	if err != nil {
-		logrus.Errorf("get ip failed, err: %v", err)
-		return
+		panic(fmt.Sprintf("get local ip failed, err:%v", err))
 	}
-	err = ini.MapTo(configObj, "./conf/config.ini")
+	// 根据本机IP获取要收集日志的配置
+	collectLogKey := fmt.Sprintf(conf.EtcdConfig.CollectSysInfoKey, ip)
+	err = etcd.Init(strings.Split(conf.EtcdConfig.Address, ","), collectLogKey)
 	if err != nil {
-		logrus.Errorf("load config failed, err: %v", err)
-		return
+		panic(fmt.Sprintf("init etcd failed, err:%v", err))
 	}
-	fmt.Printf("%#v\n", configObj)
+	log.Debug("init etcd success!")
 
-	err = kafka.Init([]string{configObj.KafkaConfig.Address}, configObj.KafkaConfig.ChanSize)
+	collectLogConf, err := etcd.GetConf(collectLogKey)
 	if err != nil {
-		logrus.Errorf("kafka int err: %v", err)
+		panic(fmt.Sprintf("get collect conf from etcd failed, err:%v", err))
 	}
-	logrus.Info("init kafka success")
+	log.Debugf("%#v", collectLogConf)
 
-	err = etcd.Init([]string{configObj.EtcdConfig.Address})
+	//  根据本机IP获取要收集系统信息的配置
+	collectSysinfoKey := fmt.Sprintf(conf.EtcdConfig.CollectSysInfoKey, ip)
+	collectSysinfoConf, err := etcd.GetSysinfoConf(collectSysinfoKey)
 	if err != nil {
-		logrus.Errorf("init etcd failed, err: %v", err)
+		panic(fmt.Sprintf("get collect sys info conf from etcd failed, err:%v", err))
 	}
-	collectKey := fmt.Sprintf(configObj.EtcdConfig.CollectKey, ip)
-	allConf, err := etcd.GetConf(collectKey)
-	if err != nil {
-		logrus.Errorf("get conf from etcd failed, err: %v", err)
+	if collectSysinfoConf == nil {
+		collectSysinfoConf = &common.CollectSysInfoConfig{
+			Interval: 5,
+			Topic:    "collect_system_info",
+		}
 	}
-	fmt.Println(allConf)
-	// 监控etcd 变化
-	go etcd.WatchConf(collectKey)
+	log.Debugf("%#v", collectSysinfoConf)
 
-	err = tailfile.Init(allConf)
+	// 获取一个新日志配置项的chan
+	newConfChan := etcd.WatchChan()
+	// 初始化tail
+	err = tailfile.Init(collectLogConf, newConfChan) // 此处为修改后的Init
 	if err != nil {
-		logrus.Errorf("tail int err: %v", err)
+		panic(fmt.Sprintf("init tail failed, err:%v", err))
 	}
-	logrus.Info("tail kafka success")
+	log.Debug("init tail success!")
 
-	if err != nil {
-		logrus.Errorf("run err: %v", err)
-	}
-	select {}
+	// 开始干活
+	run(collectLogKey, collectSysinfoConf)
+	log.Debug("logagent exit")
 }
